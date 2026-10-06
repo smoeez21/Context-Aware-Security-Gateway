@@ -29,6 +29,14 @@ from app.security.authorization import (
     authorize_request,
 )
 
+from app.security.sensitivity import (
+    analyze_resource_sensitivity,
+)
+
+from app.security.context_analyzer import (
+    analyze_context,
+)
+
 
 router = APIRouter(
     prefix="/access-request",
@@ -45,9 +53,9 @@ def process_access_request(
     db: Session = Depends(get_db)
 ):
 
-    # -------------------------------------------------
-    # Generate unique request ID
-    # -------------------------------------------------
+    # =========================================================
+    # 1. Generate unique request ID
+    # =========================================================
 
     request_code = (
         "REQ-"
@@ -57,9 +65,9 @@ def process_access_request(
     action = payload.action.value
     destination = payload.destination.value
 
-    # -------------------------------------------------
-    # Find requested resource
-    # -------------------------------------------------
+    # =========================================================
+    # 2. Find requested resource
+    # =========================================================
 
     resource = (
         db.query(Resource)
@@ -76,9 +84,19 @@ def process_access_request(
             detail="Requested resource does not exist"
         )
 
-    # -------------------------------------------------
-    # Authentication
-    # -------------------------------------------------
+    # =========================================================
+    # 3. Resource Sensitivity Analysis
+    # =========================================================
+
+    sensitivity_result = (
+        analyze_resource_sensitivity(
+            resource
+        )
+    )
+
+    # =========================================================
+    # 4. Authenticate Agent
+    # =========================================================
 
     auth_result = authenticate_agent(
         db=db,
@@ -88,9 +106,9 @@ def process_access_request(
 
     agent = auth_result["agent"]
 
-    # -------------------------------------------------
-    # Authentication FAILED
-    # -------------------------------------------------
+    # =========================================================
+    # 5. Authentication FAILED
+    # =========================================================
 
     if not auth_result["authenticated"]:
 
@@ -119,9 +137,11 @@ def process_access_request(
 
         db.add(access_request)
         db.commit()
+        db.refresh(access_request)
 
         return AccessRequestResponse(
             request_code=request_code,
+
             agent_code=payload.agent_code,
             resource_code=payload.resource_code,
 
@@ -131,18 +151,22 @@ def process_access_request(
             authentication_status="FAILED",
             authorization_status="NOT_CHECKED",
 
+            resource_sensitivity=(
+                sensitivity_result["sensitivity"]
+            ),
+
+            context=None,
+
             decision="BLOCK",
 
             reason=auth_result["reason"],
 
-            timestamp=datetime.now(
-                timezone.utc
-            )
+            timestamp=access_request.requested_at
         )
 
-    # -------------------------------------------------
-    # Authentication SUCCESSFUL
-    # -------------------------------------------------
+    # =========================================================
+    # 6. Authorization
+    # =========================================================
 
     authorization_result = authorize_request(
         db=db,
@@ -152,14 +176,15 @@ def process_access_request(
         destination=destination
     )
 
-    # -------------------------------------------------
-    # Authorization FAILED
-    # -------------------------------------------------
+    # =========================================================
+    # 7. Authorization FAILED
+    # =========================================================
 
     if not authorization_result["authorized"]:
 
         access_request = AccessRequest(
             request_code=request_code,
+
             agent_id=agent.id,
             resource_id=resource.id,
 
@@ -177,6 +202,7 @@ def process_access_request(
 
         db.add(access_request)
         db.commit()
+        db.refresh(access_request)
 
         return AccessRequestResponse(
             request_code=request_code,
@@ -190,18 +216,41 @@ def process_access_request(
             authentication_status="SUCCESS",
             authorization_status="DENIED",
 
+            resource_sensitivity=(
+                sensitivity_result["sensitivity"]
+            ),
+
+            context=None,
+
             decision="BLOCK",
 
             reason=authorization_result["reason"],
 
-            timestamp=datetime.now(
-                timezone.utc
-            )
+            timestamp=access_request.requested_at
         )
 
-    # -------------------------------------------------
-    # Authentication + Authorization SUCCESSFUL
-    # -------------------------------------------------
+    # =========================================================
+    # 8. Context Analysis
+    # =========================================================
+
+    context_result = analyze_context(
+        db=db,
+        agent_id=agent.id,
+        resource_id=resource.id,
+        action=action,
+        destination=destination
+    )
+
+    # =========================================================
+    # 9. Authentication + Authorization SUCCESSFUL
+    # =========================================================
+    #
+    # IMPORTANT:
+    # Phase 5 detects context only.
+    #
+    # The final risk-based decision will be added in Phase 6.
+    # For now, authorized requests still receive ALLOW.
+    # =========================================================
 
     access_request = AccessRequest(
         request_code=request_code,
@@ -223,6 +272,11 @@ def process_access_request(
 
     db.add(access_request)
     db.commit()
+    db.refresh(access_request)
+
+    # =========================================================
+    # 10. Return Gateway Response
+    # =========================================================
 
     return AccessRequestResponse(
         request_code=request_code,
@@ -236,11 +290,15 @@ def process_access_request(
         authentication_status="SUCCESS",
         authorization_status="ALLOWED",
 
+        resource_sensitivity=(
+            sensitivity_result["sensitivity"]
+        ),
+
+        context=context_result,
+
         decision="ALLOW",
 
         reason=authorization_result["reason"],
 
-        timestamp=datetime.now(
-            timezone.utc
-        )
+        timestamp=access_request.requested_at
     )
