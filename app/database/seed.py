@@ -1,4 +1,4 @@
-import hashlib
+from app.security.credentials import hash_credential
 
 from app.database.database import (
     SessionLocal,
@@ -10,13 +10,6 @@ from app.database.models import (
     Policy,
     Resource
 )
-
-
-def hash_credential(credential: str) -> str:
-    return hashlib.sha256(
-        credential.encode("utf-8")
-    ).hexdigest()
-
 
 def seed_agents(db):
 
