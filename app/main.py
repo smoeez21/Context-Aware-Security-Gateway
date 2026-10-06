@@ -8,7 +8,7 @@ from app.database.database import create_database
 from app.api.agents import router as agents_router
 from app.api.resources import router as resources_router
 from app.api.policies import router as policies_router
-
+from app.api.access import router as access_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,7 +32,7 @@ app = FastAPI(
 app.include_router(agents_router)
 app.include_router(resources_router)
 app.include_router(policies_router)
-
+app.include_router(access_router)
 
 @app.get("/")
 def home():
