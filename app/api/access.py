@@ -17,6 +17,11 @@ from app.database.models import (
     AccessRequest,
     Resource,
     RiskAssessment,
+    Approval,
+)
+
+from app.database.execution_models import (
+    RequestPayload,
 )
 
 from app.schemas.request import (
@@ -48,16 +53,20 @@ from app.security.decision_engine import (
     make_security_decision,
 )
 
+from app.services.resource_executor import (
+    execute_resource,
+)
+
+from app.services.audit_service import (
+    save_audit_log,
+)
+
 
 router = APIRouter(
     prefix="/access-request",
     tags=["Security Gateway"],
 )
 
-
-# ============================================================
-# PROCESS ACCESS REQUEST
-# ============================================================
 
 @router.post(
     "",
@@ -68,20 +77,28 @@ def process_access_request(
     db: Session = Depends(get_db),
 ):
 
-    # --------------------------------------------------------
-    # 1. Generate Request ID
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. Request Identity
+    # ========================================================
 
-    request_code = (
-        "REQ-" + uuid4().hex.upper()
-    )
+    request_code = "REQ-" + uuid4().hex.upper()
 
     action = payload.action.value
     destination = payload.destination.value
 
-    # --------------------------------------------------------
-    # 2. Identify Requested Resource
-    # --------------------------------------------------------
+    # Validate required operation payload.
+    if action in {"WRITE", "UPDATE"}:
+        if payload.payload_data is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "WRITE and UPDATE require payload_data."
+                ),
+            )
+
+    # ========================================================
+    # 2. Resource Lookup
+    # ========================================================
 
     resource = (
         db.query(Resource)
@@ -92,39 +109,111 @@ def process_access_request(
         .first()
     )
 
+    # Unknown resource attempts must also be logged.
     if resource is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Requested resource does not exist",
+
+        request = AccessRequest(
+            request_code=request_code,
+            agent_id=None,
+            resource_id=None,
+            presented_agent_code=payload.agent_code,
+            action=action,
+            destination=destination,
+            authentication_status="NOT_CHECKED",
+            authorization_status="DENIED",
+            decision="BLOCK",
+            status="COMPLETED",
         )
 
-    # --------------------------------------------------------
-    # 3. Resource Sensitivity Analysis
-    # --------------------------------------------------------
+        try:
+            db.add(request)
+            db.flush()
 
-    sensitivity_result = (
-        analyze_resource_sensitivity(resource)
+            db.add(
+                RiskAssessment(
+                    request_id=request.id,
+                    risk_score=80,
+                    risk_level="CRITICAL",
+                    permission_violation=True,
+                    sensitive_resource=False,
+                    external_destination=(
+                        destination == "EXTERNAL"
+                    ),
+                    reasons=json.dumps([
+                        {
+                            "factor": "Unknown resource",
+                            "points": 80,
+                        }
+                    ]),
+                )
+            )
+
+            save_audit_log(
+                db=db,
+                access_request=request,
+                resource_name=payload.resource_code,
+                risk_score=80,
+                risk_level="CRITICAL",
+                decision="BLOCK",
+                reason="Unknown resource identifier.",
+                final_outcome="ACCESS_DENIED",
+            )
+
+            db.commit()
+            db.refresh(request)
+
+        except Exception:
+            db.rollback()
+            raise
+
+        return AccessRequestResponse(
+            request_code=request_code,
+            agent_code=payload.agent_code,
+            resource_code=payload.resource_code,
+            action=action,
+            destination=destination,
+            authentication_status="NOT_CHECKED",
+            authorization_status="DENIED",
+            resource_sensitivity=None,
+            context=None,
+            risk_score=80,
+            risk_level="CRITICAL",
+            risk_factors=[
+                {
+                    "factor": "Unknown resource",
+                    "points": 80,
+                }
+            ],
+            decision="BLOCK",
+            reason="Unknown resource identifier.",
+            status="COMPLETED",
+            timestamp=request.requested_at,
+        )
+
+    # ========================================================
+    # 3. Sensitivity
+    # ========================================================
+
+    sensitivity = analyze_resource_sensitivity(
+        resource
     )
 
-    # --------------------------------------------------------
-    # 4. Agent Authentication
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. Authentication
+    # ========================================================
 
-    auth_result = authenticate_agent(
+    auth = authenticate_agent(
         db=db,
         agent_code=payload.agent_code,
         credential=payload.credential,
     )
 
-    agent = auth_result["agent"]
-
-    authenticated = auth_result["authenticated"]
-
-    # --------------------------------------------------------
-    # 5. Set Default Security States
-    # --------------------------------------------------------
+    agent = auth["agent"]
+    authenticated = auth["authenticated"]
 
     authorized = False
+    authorization_reason = None
+    context = None
 
     authentication_status = (
         "SUCCESS" if authenticated else "FAILED"
@@ -132,17 +221,13 @@ def process_access_request(
 
     authorization_status = "NOT_CHECKED"
 
-    authorization_reason = None
-
-    context_result = None
-
-    # --------------------------------------------------------
-    # 6. Authorization
-    # --------------------------------------------------------
+    # ========================================================
+    # 5. Authorization and Context
+    # ========================================================
 
     if authenticated:
 
-        authorization_result = authorize_request(
+        authz = authorize_request(
             db=db,
             agent_id=agent.id,
             resource_id=resource.id,
@@ -150,21 +235,16 @@ def process_access_request(
             destination=destination,
         )
 
-        authorized = authorization_result["authorized"]
-
-        authorization_reason = authorization_result["reason"]
+        authorized = authz["authorized"]
+        authorization_reason = authz["reason"]
 
         authorization_status = (
             "ALLOWED" if authorized else "DENIED"
         )
 
-        # ----------------------------------------------------
-        # 7. Context Analysis
-        # ----------------------------------------------------
-
         if authorized:
 
-            context_result = analyze_context(
+            context = analyze_context(
                 db=db,
                 agent_id=agent.id,
                 resource_id=resource.id,
@@ -172,193 +252,214 @@ def process_access_request(
                 destination=destination,
             )
 
-            # Additional derived risk indicator.
-            # This is included only in risk calculation,
-            # not in the existing context response schema.
-
-            context_result["sensitive_external_send"] = (
+            context["sensitive_external_send"] = (
                 action == "SEND"
                 and destination == "EXTERNAL"
-                and sensitivity_result["sensitivity"]
+                and sensitivity["sensitivity"]
                 in {"HIGH", "CRITICAL"}
             )
 
-    # --------------------------------------------------------
-    # 8. Calculate Risk
-    # --------------------------------------------------------
+    # ========================================================
+    # 6. Risk
+    # ========================================================
 
-    risk_result = calculate_risk(
+    risk = calculate_risk(
         authenticated=authenticated,
         authorized=authorized,
-        sensitivity_result=sensitivity_result,
-        context_result=context_result,
+        sensitivity_result=sensitivity,
+        context_result=context,
     )
 
-    risk_score = risk_result["risk_score"]
-    risk_level = risk_result["risk_level"]
+    # ========================================================
+    # 7. Decision
+    # ========================================================
 
-    # --------------------------------------------------------
-    # 9. Make Final Security Decision
-    # --------------------------------------------------------
-
-    decision_result = make_security_decision(
+    result = make_security_decision(
         authenticated=authenticated,
         authorized=authorized,
-        risk_score=risk_score,
+        risk_score=risk["risk_score"],
     )
 
-    decision = decision_result["decision"]
-    decision_reason = decision_result["reason"]
+    decision = result["decision"]
+    reason = result["reason"]
 
-    # Preserve the specific failure explanation.
     if not authenticated:
-        decision_reason = auth_result["reason"]
+        reason = auth["reason"]
 
     elif not authorized:
-        decision_reason = authorization_reason
+        reason = authorization_reason
 
-    # --------------------------------------------------------
-    # 10. Determine Request Status
-    # --------------------------------------------------------
-    #
-    # Phase 6 does NOT actually execute protected resources.
-    #
-    # ALLOW means authorization and risk checks passed,
-    # but resource execution is still pending implementation.
-    #
-    # HUMAN_APPROVAL does not execute the request.
-    # The approval queue will be implemented in Phase 7.
-    # --------------------------------------------------------
+    # ========================================================
+    # 8. Initial Request Status
+    # ========================================================
 
     if decision == "ALLOW":
-        request_status = "AUTHORIZED_NOT_EXECUTED"
+        status = "AUTHORIZED_NOT_EXECUTED"
 
     elif decision == "HUMAN_APPROVAL":
-        request_status = "PENDING_APPROVAL"
+        status = "PENDING_APPROVAL"
 
     else:
-        request_status = "COMPLETED"
+        status = "COMPLETED"
 
-    # --------------------------------------------------------
-    # 11. Create Access Request Database Record
-    # --------------------------------------------------------
+    # ========================================================
+    # 9. Create Request
+    # ========================================================
 
-    access_request = AccessRequest(
+    request = AccessRequest(
         request_code=request_code,
-
         agent_id=agent.id if agent else None,
-
         resource_id=resource.id,
-
         presented_agent_code=payload.agent_code,
-
         action=action,
         destination=destination,
-
         authentication_status=authentication_status,
         authorization_status=authorization_status,
-
         decision=decision,
-        status=request_status,
+        status=status,
     )
-
-    # --------------------------------------------------------
-    # 12. Save Request and Risk Assessment Together
-    # --------------------------------------------------------
 
     try:
 
-        db.add(access_request)
-
-        # Generates database ID before creating
-        # the linked risk assessment.
-
+        db.add(request)
         db.flush()
 
-        risk_assessment = RiskAssessment(
-            request_id=access_request.id,
+        # ====================================================
+        # 10. Save Risk Assessment
+        # ====================================================
 
-            risk_score=risk_score,
-            risk_level=risk_level,
-
+        assessment = RiskAssessment(
+            request_id=request.id,
+            risk_score=risk["risk_score"],
+            risk_level=risk["risk_level"],
             permission_violation=(
                 authenticated and not authorized
             ),
-
             sensitive_resource=(
-                sensitivity_result["is_sensitive"]
+                sensitivity["is_sensitive"]
             ),
-
             external_destination=(
                 destination == "EXTERNAL"
             ),
-
             unusual_activity=(
-                context_result.get("unusual_activity", False)
-                if context_result
-                else False
+                context.get("unusual_activity", False)
+                if context else False
             ),
-
             high_frequency=(
-                context_result.get("high_frequency", False)
-                if context_result
-                else False
+                context.get("high_frequency", False)
+                if context else False
             ),
-
             suspicious_sequence=(
-                context_result.get("suspicious_sequence", False)
-                if context_result
-                else False
+                context.get("suspicious_sequence", False)
+                if context else False
             ),
-
             reasons=json.dumps(
-                risk_result["risk_factors"]
+                risk["risk_factors"]
             ),
         )
 
-        db.add(risk_assessment)
+        db.add(assessment)
 
-        # Single transaction:
-        # both records succeed or both fail.
+        # ====================================================
+        # 11. Preserve Original Payload
+        # ====================================================
+
+        if payload.payload_data is not None:
+
+            db.add(
+                RequestPayload(
+                    request_id=request.id,
+                    payload_json=json.dumps(
+                        payload.payload_data
+                    ),
+                )
+            )
+
+        # ====================================================
+        # 12. Enforce Decision
+        # ====================================================
+
+        if decision == "ALLOW":
+
+            try:
+
+                execute_resource(
+                    db=db,
+                    access_request=request,
+                    resource=resource,
+                    payload_data=payload.payload_data,
+                )
+
+                request.status = "EXECUTED"
+                final_outcome = "EXECUTED"
+
+            except ValueError as exc:
+
+                request.status = "EXECUTION_FAILED"
+                final_outcome = "EXECUTION_FAILED"
+                reason = str(exc)
+
+        elif decision == "HUMAN_APPROVAL":
+
+            approval = Approval(
+                request_id=request.id,
+                status="PENDING",
+            )
+
+            db.add(approval)
+
+            final_outcome = "PENDING_APPROVAL"
+
+        else:
+
+            final_outcome = "ACCESS_DENIED"
+
+        # ====================================================
+        # 13. Audit Logging
+        # ====================================================
+
+        save_audit_log(
+            db=db,
+            access_request=request,
+            resource_name=resource.name,
+            risk_score=risk["risk_score"],
+            risk_level=risk["risk_level"],
+            decision=decision,
+            reason=reason,
+            final_outcome=final_outcome,
+        )
+
+        # ====================================================
+        # 14. Commit Everything
+        # ====================================================
 
         db.commit()
-
-        db.refresh(access_request)
+        db.refresh(request)
 
     except Exception:
+
         db.rollback()
         raise
 
-    # --------------------------------------------------------
-    # 13. Return Complete Gateway Response
-    # --------------------------------------------------------
+    # ========================================================
+    # 15. Return Response
+    # ========================================================
 
     return AccessRequestResponse(
         request_code=request_code,
-
         agent_code=payload.agent_code,
         resource_code=payload.resource_code,
-
         action=action,
         destination=destination,
-
         authentication_status=authentication_status,
         authorization_status=authorization_status,
-
-        resource_sensitivity=(
-            sensitivity_result["sensitivity"]
-        ),
-
-        context=context_result,
-
-        risk_score=risk_score,
-        risk_level=risk_level,
-        risk_factors=risk_result["risk_factors"],
-
+        resource_sensitivity=sensitivity["sensitivity"],
+        context=context,
+        risk_score=risk["risk_score"],
+        risk_level=risk["risk_level"],
+        risk_factors=risk["risk_factors"],
         decision=decision,
-        reason=decision_reason,
-
-        status=request_status,
-
-        timestamp=access_request.requested_at,
+        reason=reason,
+        status=request.status,
+        timestamp=request.requested_at,
     )
