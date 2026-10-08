@@ -36,6 +36,10 @@ from app.api.audit import (
     router as audit_router,
 )
 
+from app.api.monitoring import (
+    router as monitoring_router,
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -62,6 +66,7 @@ app.include_router(policies_router)
 app.include_router(access_router)
 app.include_router(approvals_router)
 app.include_router(audit_router)
+app.include_router(monitoring_router)
 
 
 @app.get("/")
